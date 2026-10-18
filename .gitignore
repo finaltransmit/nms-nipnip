@@ -1,0 +1,4 @@
+__pycache__/
+*.log
+# the data tables come in the release zip (built from your own game files)
+METADATA/
