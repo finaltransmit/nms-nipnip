@@ -39,7 +39,6 @@ import time
 import pymhf.core._internal as _internal
 from pymhf import FUNCDEF, Mod
 from pymhf.core.hooking import manual_hook
-from pymhf.core.memutils import find_pattern_in_binary
 from pymhf.core.mod_loader import mod_manager
 
 import nmspy.data.types as nms
@@ -71,10 +70,7 @@ VIVID = ["Weird3", "HueShiftC", "NMSRetroG", "Weird6", "Cyan", "Fuchsia", "HueSh
 
 # ------------------------------------------------------------------ game data layout ----
 # cGcFullscreenEffectManager::SetScreenFilter(this, eScreenFilter, eFilterSlot, float strength, float extra
-# fade distance) on 180836 (NMS+0x916590); unique in .text.
-SET_SCREEN_FILTER_SIG = ("48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 F3 0F 10 0D ? ? ? ? "
-                         "48 8D B9 ? ? ? ? 48 8B 07 0F 57 C0 F3 0F 10 15 ? ? ? ? F3 0F 5F C3 4C 63 D2 4C 8B "
-                         "C9 49 63 D8 F3 0F 5D C8")
+# fade distance): found through ADDRESSES["SET_SCREEN_FILTER"] below.
 SLOT_BASE, SLOT_FAR, SLOT_STORM, SLOT_EFFECT = 0, 1, 2, 3  # eFilterSlot
 MGR_ACTIVE_FILTERS = 0xEC  # int32[4], active filter per slot
 MGR_STRENGTHS = 0xFC  # float[4], strength per slot
@@ -92,6 +88,10 @@ MGR_STRENGTHS = 0xFC  # float[4], strength per slot
 # optional masked "prologue", "value": inside "range") and the optional live "check" ("ptr", "vft", "vft:<class>",
 # "u32<N"; a null pointer passes). Nothing found -> 0 and a warning; the caller switches that feature off. Only on
 # the build the "known" values were verified on (180836) is a failed lookup replaced by the known value.
+# Backups for "code" entries, used when the patterns find nothing or disagree (then they pick among the candidates):
+# "vft": ["<class>", <slot>] - the function in that slot of the class's vftable, found through RTTI by the class
+# name (no pattern at all); "nmspy": "<class>::<method>" - NMS.py's own pattern for it (the installed NMS.py, which
+# StartCoop keeps matched to the game). "name" is the function's 4.13 name, for tools/resign.py only.
 import ctypes as _actypes
 import re as _are
 import sys as _asys
@@ -119,7 +119,7 @@ class _AddrImage:
 
     def __init__(self, base: int = 0, path: str = ""):
         import pefile
-        self.base, self._file = base, None
+        self.base, self._file, self._rtti = base, None, {}
         if base:
             head = _addr_peek(base, 0x1000)
             if head is None:
@@ -128,6 +128,7 @@ class _AddrImage:
         else:
             pe = self._file = pefile.PE(path, fast_load=True)
         self.build = (pe.FILE_HEADER.TimeDateStamp, pe.OPTIONAL_HEADER.SizeOfImage)
+        self.image_base = base or pe.OPTIONAL_HEADER.ImageBase  # (what pointers in the data hold)
         self.sections = [(s.Name.rstrip(b"\0").decode(errors="replace"), s.VirtualAddress, s.Misc_VirtualSize,
                           s.Characteristics) for s in pe.sections]
         if base and path:
@@ -302,6 +303,58 @@ def _addr_check(img, spec: dict, v: int):
     return None
 
 
+def _addr_vft(img, cls: str, slot: int) -> int:
+    """RVA of the function in vftable slot `slot` of class `cls` (RTTI: type descriptor -> COL -> vftable), or 0."""
+    key = (cls, slot)
+    if key not in img._rtti:
+        img._rtti[key] = 0
+        secs = {name: (va, size) for name, va, size, _ in img.sections}
+        if ".data" in secs and ".rdata" in secs:
+            dva, dsz = secs[".data"]
+            rva_, rsz = secs[".rdata"]
+            if "_data" not in img._rtti:
+                img._rtti["_data"], img._rtti["_rdata"] = img.read(dva, dsz) or b"", img.read(rva_, rsz) or b""
+            data, rdata = img._rtti["_data"], img._rtti["_rdata"]
+            # pointers in the bytes read: relative to the file's ImageBase when they came from the exe file (also in
+            # the game: read() takes the file for the running build), else to where the image is loaded
+            pbase = img._file.OPTIONAL_HEADER.ImageBase if img._file is not None else img.image_base
+            td = data.find(b".?AV" + cls.encode() + b"@@\0")
+            if td >= 0:
+                td_rva = dva + td - 16
+                for m in _are.finditer(_are.escape(td_rva.to_bytes(4, "little")), rdata):
+                    o = m.start() - 12  # COL: signature 1, offset 0, cdOffset, pTypeDescriptor, ...
+                    if o >= 0 and rdata[o:o + 8] == b"\x01" + b"\0" * 7:
+                        i = rdata.find((pbase + rva_ + o).to_bytes(8, "little"))
+                        if i >= 0:
+                            fn = rdata[i + 8 + 8 * slot:i + 16 + 8 * slot]
+                            if len(fn) == 8:
+                                img._rtti[key] = int.from_bytes(fn, "little") - pbase
+                            break
+    return img._rtti[key]
+
+
+def _addr_nmspy_sig(name: str):
+    """The installed NMS.py's pattern for "<class>::<method>", or None (its source is read, nothing is imported)."""
+    cache = getattr(_asys, "_nms_addr_nmspy_src", None)
+    if cache is None:
+        cache = ""
+        try:
+            import importlib.util
+            import os.path
+            spec = importlib.util.find_spec("nmspy")
+            if spec and spec.origin:
+                with open(os.path.join(os.path.dirname(spec.origin), "data", "types.py"), encoding="utf-8") as f:
+                    cache = f.read()
+        except Exception:
+            pass
+        setattr(_asys, "_nms_addr_nmspy_src", cache)
+    cls, _, meth = name.partition("::")
+    m = _are.search(r"^class " + _are.escape(cls) + r"\(.*?(?=^class |\Z)", cache, _are.M | _are.S)
+    d = m and _are.search(r'function_hook\(\s*(?:signature=)?"([^"]+)"[^\n]*\)\s*\n(?:\s*@\w+[^\n]*\n)*\s*def '
+                          + _are.escape(meth) + r"\(", m.group(0))  # (static ones carry @staticmethod in between)
+    return " ".join("?" if t in ("?", "??") else t for t in d.group(1).split()) if d else None
+
+
 def _addr_lookup(img, spec: dict, env: dict):
     """(value or 0, problem or None, per-pattern notes)."""
     found, notes = set(), []
@@ -315,6 +368,28 @@ def _addr_lookup(img, spec: dict, env: dict):
         notes.append("1" if len(vals) == 1 else f"{len(vals)} values" if vals else "0")
         if len(vals) == 1:
             found |= vals
+    if len(found) != 1 and spec["kind"] == "code":
+        # the backups: a vftable slot by class name, then NMS.py's pattern; each either fills in when nothing was
+        # found or picks one of the disagreeing candidates, and must pass the same checks
+        backups = []
+        if spec.get("vft"):
+            try:
+                backups.append(("vft", _addr_vft(img, spec["vft"][0], spec["vft"][1])))
+            except Exception:
+                backups.append(("vft", 0))
+        if spec.get("nmspy"):
+            sig = _addr_nmspy_sig(spec["nmspy"])
+            try:
+                vals = _addr_scan(img, sig, env) if sig else frozenset()
+            except Exception:
+                vals = frozenset()
+            backups.append(("nmspy", next(iter(vals)) if len(vals) == 1 else 0))
+        for what, v in backups:
+            notes.append(f"{what} {'-' if not v else hex(v)}")
+            if v and (not found or v in found) and not _addr_check(img, spec, v):
+                found = {v}
+                notes.append(f"(by {what})")
+                break
     if not found:
         return 0, "no pattern matched", notes
     if len(found) > 1:
@@ -357,8 +432,14 @@ def _addr_resolve(specs: dict, log, img=None) -> dict:
 # Game addresses (see the block above; tools/check_addresses.py verifies them offline). "known": the
 # value on build 180836, used only on that build if the patterns fail there.
 ADDRESSES = {
-    # cGcFullscreenEffectManager::SetScreenFilter (the hook's own signature)
-    "SET_SCREEN_FILTER": {"kind": "code", "known": 0x916590, "sigs": [SET_SCREEN_FILTER_SIG]},
+    # cGcFullscreenEffectManager::SetScreenFilter: its start and two of its callers (all hold on 180836 and 183877)
+    "SET_SCREEN_FILTER": {"kind": "code", "known": 0x916590, "name": "cGcFullscreenEffectManager::SetScreenFilter",
+                          "sigs": [
+        "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 F3 0F 10 0D ? ? ? ? 48 8D B9 ? ? ? ? 48 8B 07 "
+        "0F 57 C0 F3 0F 10 15 ? ? ? ? F3 0F 5F C3 4C 63 D2 4C 8B C9 49 63 D8 F3 0F 5D C8",
+        "0F 28 DF 45 33 C0 8B D3 E8 * * * * 48 8B 0D",
+        "F3 0F 11 6C 24 20 8B 92 ? ? ? ? E8 * * * * 48 8B 57 08",
+    ]},
     # gApplication.mpData (cGcApplication::Data*): the callers of SetScreenFilter load it (mov rcx,[it]; add rcx,
     # <manager>; ... call SetScreenFilter, 19 sites) and three unrelated readers (those also match 4.13)
     "APP_DATA_SLOT": {"kind": "data", "known": 0x6E8D708, "check": "ptr", "sigs": [
@@ -368,12 +449,35 @@ ADDRESSES = {
         "48 8B 0D * * * * 83 B9 ? ? ? ? 03 75 ? 4C 8D 8D ? ? ? ?",
     ]},
     # Data -> its cGcFullscreenEffectManager (Data.mSimulation + cGcSimulation.mFullscreenEffectManager): the "add
-    # rcx,<offset>" of those same SetScreenFilter callers
+    # rcx,<offset>" of those same SetScreenFilter callers, and of two other users of the manager
     "DATA_TO_FX_MANAGER": {"kind": "value", "known": 0x72A3A0, "range": (0x100, 0x10000000), "sigs": [
         "48 8B 0D ? ? ? ? [0-16] 48 81 C1 # # # # [0-24] E8 =SET_SCREEN_FILTER",
+        "83 F8 53 77 ? 48 81 C1 # # # # F3 0F 11 74 24 20",
+        "48 8B 0D ? ? ? ? 48 81 C1 # # # # 85 D2 75 ? 0F 57",
+    ]},
+    # The two "hold to consume" job functions (see CONSUME_POPUP below): each by its start, which tests the "can
+    # afford" flag at the capture's offset (+0x78 / +0x68), and by the job runner that calls it and then frees the
+    # 0x80 / 0x70-byte capture. Both name the capture's layout, so a build that changes it leaves the hook off
+    # instead of reading the wrong fields.
+    "CONSUME_POPUP": {"kind": "code", "known": 0x6A0BA0,
+                      "name": "`cGcFrontendPageFunctions::DoProductSlot'::`72'::<lambda_1>::operator()", "sigs": [
+        "48 89 5C 24 20 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 ? 48 81 EC ? ? ? ? 33 F6 4C 8B F9 49 C7 "
+        "C6 FF FF FF FF 40 38 71 78 0F 84",
+        "48 85 C9 74 ? 53 48 83 EC 20 48 8B D9 E8 * * * * BA 80 00 00 00 48 8B CB E8",
+    ]},
+    # (the inventory grid's: not in the 4.13 name maps)
+    "CONSUME_GRID": {"kind": "code", "known": 0x6A6A60, "sigs": [
+        "48 89 5C 24 20 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 ? 48 81 EC ? ? ? ? 33 F6 4C 8B F9 49 C7 "
+        "C6 FF FF FF FF 40 38 71 68 0F 84",
+        "48 85 C9 74 ? 53 48 83 EC 20 48 8B D9 E8 * * * * BA 70 00 00 00 48 8B CB E8",
     ]},
 }
 _RESOLVED = _addr_resolve(ADDRESSES, logger)
+for _what, _off in (("SET_SCREEN_FILTER", "NipNip can't switch screen filters on this build"),
+                    ("CONSUME_POPUP", "eating a bud from the product popup does nothing on this build"),
+                    ("CONSUME_GRID", "eating a bud from the inventory grid does nothing on this build")):
+    if not _RESOLVED[_what]:
+        logger.warning("%s not found: %s", _what, _off)
 # Fallback if SetScreenFilter has not been seen yet: [gApplication.mpData] + DATA_TO_FX_MANAGER
 # (Data.mSimulation + cGcSimulation.mFullscreenEffectManager), as every caller does (0 = not found on this build)
 APP_DATA_SLOT = _RESOLVED["APP_DATA_SLOT"]
@@ -381,13 +485,11 @@ DATA_TO_FX_MANAGER = _RESOLVED["DATA_TO_FX_MANAGER"]
 BUDS_REWARD = b"R_NIPNIP"  # reward the data mod gives when a bud is consumed
 # Eating from the inventory doesn't go through GiveGenericReward: when the "hold to consume" completes, the
 # UI queues a job that looks the reward up itself and calls GiveRewardsFromList. There are two such job
-# functions on 180836 (product-slot popup NMS+0x6A0BA0, inventory grid NMS+0x6A6A60); their only argument is
-# the captured state: +0x00 the effective reward ID (TkID<128>), then seed, store, slot, a copy of the slot
-# element and the cGcConsumableItem*; a "can afford" flag (0 = the consume fails) sits at +0x78 / +0x68.
-CONSUME_SIG = ("48 89 5C 24 20 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 ? 48 81 EC ? ? ? ? 33 F6 4C 8B F9 49 C7 "
-               "C6 FF FF FF FF 40 38 71 {} 0F 84")
-CONSUME_POPUP = {"sig": CONSUME_SIG.format("78"), "can_afford": 0x78, "product": 0x38}
-CONSUME_GRID = {"sig": CONSUME_SIG.format("68"), "can_afford": 0x68, "product": 0x30}
+# functions (product-slot popup NMS+0x6A0BA0, inventory grid NMS+0x6A6A60 on 180836; ADDRESSES finds them); their
+# only argument is the captured state: +0x00 the effective reward ID (TkID<128>), then seed, store, slot, a copy of
+# the slot element and the cGcConsumableItem*; a "can afford" flag (0 = the consume fails) sits at +0x78 / +0x68.
+CONSUME_POPUP = {"can_afford": 0x78, "product": 0x38}
+CONSUME_GRID = {"can_afford": 0x68, "product": 0x30}
 NUM_FILTERS = len(cGcScreenFilters)  # 85 on 180836; also the game's "no filter requested" value
 
 _k32 = ctypes.WinDLL("kernel32")  # private instance, so the argtypes below don't leak to other mods
@@ -712,16 +814,14 @@ class NipNip(Mod):
         self._buds_until = 0.0  # monotonic time the current bud effect ends, 0 = no bud effect
         self._retired = False
         self._take_over()
-        off_ = find_pattern_in_binary(SET_SCREEN_FILTER_SIG, False)
+        off_ = _RESOLVED["SET_SCREEN_FILTER"]  # (0: not found, logged with the address lookup)
         self._set_filter = None
-        if off_ is None:
-            logger.error("SetScreenFilter not found - NipNip can't switch filters on this build")
-        else:
+        if off_:
             self._set_filter = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32,
                                                 ctypes.c_float, ctypes.c_float)(_internal.BASE_ADDRESS + off_)
             logger.info("NipNip %s loaded; SetScreenFilter at NMS+0x%X", self.__version__, off_)
 
-    @manual_hook("cGcFullscreenEffectManager::SetScreenFilter", pattern=SET_SCREEN_FILTER_SIG,
+    @manual_hook("cGcFullscreenEffectManager::SetScreenFilter", offset=_RESOLVED["SET_SCREEN_FILTER"] or None,
                  func_def=FUNCDEF(None, [ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32, ctypes.c_float,
                                          ctypes.c_float]), detour_time="before")
     def on_set_screen_filter(self, this, filt, slot, strength, distance):
@@ -757,13 +857,13 @@ class NipNip(Mod):
         return data + DATA_TO_FX_MANAGER if data else 0
 
     # ------------------------------------------------------------------- the item ----
-    @manual_hook("NipNip consume (product popup)", pattern=CONSUME_POPUP["sig"], func_def=FUNCDEF(None, [ctypes.c_void_p]),
-                 detour_time="before")
+    @manual_hook("NipNip consume (product popup)", offset=_RESOLVED["CONSUME_POPUP"] or None,
+                 func_def=FUNCDEF(None, [ctypes.c_void_p]), detour_time="before")
     def on_consume_popup(self, cap):
         self._on_consume(cap, CONSUME_POPUP)
 
-    @manual_hook("NipNip consume (inventory grid)", pattern=CONSUME_GRID["sig"], func_def=FUNCDEF(None, [ctypes.c_void_p]),
-                 detour_time="before")
+    @manual_hook("NipNip consume (inventory grid)", offset=_RESOLVED["CONSUME_GRID"] or None,
+                 func_def=FUNCDEF(None, [ctypes.c_void_p]), detour_time="before")
     def on_consume_grid(self, cap):
         self._on_consume(cap, CONSUME_GRID)
 
